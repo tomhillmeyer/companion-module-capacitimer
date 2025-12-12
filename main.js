@@ -4,6 +4,7 @@ const UpdateActions = require('./actions')
 const UpdateFeedbacks = require('./feedbacks')
 const UpdateVariableDefinitions = require('./variables')
 const WebSocket = require('ws')
+const { Bonjour } = require('bonjour-service')
 
 class ModuleInstance extends InstanceBase {
 	constructor(internal) {
@@ -32,19 +33,30 @@ class ModuleInstance extends InstanceBase {
 			countUpAfterZero: false,
 			showTimeOfDay: true,
 		}
+
+		this.discoveredInstances = []
+		this.bonjour = null
+		this.bonjourBrowser = null
 	}
 
 	async init(config) {
 		this.config = config
 
-		this.updateStatus(InstanceStatus.Connecting)
-
 		this.updateActions()
 		this.updateFeedbacks()
 		this.updateVariableDefinitions()
 
-		this.initWebSocket()
-		this.pollTimer()
+		this.startBonjourDiscovery()
+
+		// Only connect if a host is configured
+		const host = this.config.host || this.config.discovered
+		if (host) {
+			this.updateStatus(InstanceStatus.Connecting)
+			this.initWebSocket()
+			this.pollTimer()
+		} else {
+			this.updateStatus(InstanceStatus.Disconnected, 'No Capacitimer instance selected')
+		}
 	}
 
 	async destroy() {
@@ -59,6 +71,7 @@ class ModuleInstance extends InstanceBase {
 		if (this.pollInterval) {
 			clearInterval(this.pollInterval)
 		}
+		this.stopBonjourDiscovery()
 	}
 
 	async configUpdated(config) {
@@ -66,45 +79,154 @@ class ModuleInstance extends InstanceBase {
 		if (this.ws) {
 			this.ws.close()
 		}
-		this.initWebSocket()
+
+		// Only connect if a host is configured
+		const host = this.config.host || this.config.discovered
+		if (host) {
+			this.updateStatus(InstanceStatus.Connecting)
+			this.initWebSocket()
+		} else {
+			this.updateStatus(InstanceStatus.Disconnected, 'No Capacitimer instance selected')
+		}
 	}
 
 	getConfigFields() {
 		return [
 			{
+				type: 'dropdown',
+				id: 'discovered',
+				label: 'Discovered Capacitimers',
+				width: 12,
+				default: '',
+				choices: [
+					{ id: '', label: ' ' },
+					...this.discoveredInstances.map((instance) => ({
+						id: instance.host,
+						label: instance.host,
+					})),
+				],
+				tooltip: 'Select a discovered Capacitimer instance from the network',
+			},
+			{
 				type: 'textinput',
 				id: 'host',
-				label: 'Capacitimer Host',
-				width: 8,
-				default: 'localhost',
-			},
-			{
-				type: 'number',
-				id: 'httpPort',
-				label: 'HTTP Port',
-				width: 4,
-				default: 80,
-				min: 1,
-				max: 65535,
-			},
-			{
-				type: 'number',
-				id: 'wsPort',
-				label: 'WebSocket Port',
-				width: 4,
-				default: 3001,
-				min: 1,
-				max: 65535,
+				label: 'Manual IP Address (optional)',
+				width: 12,
+				default: '',
+				tooltip: 'Manually enter hostname or IP address',
 			},
 		]
 	}
 
+	startBonjourDiscovery() {
+		try {
+			this.bonjour = new Bonjour()
+			this.bonjourBrowser = this.bonjour.find({ type: 'http' })
+
+			this.bonjourBrowser.on('up', (service) => {
+				// Only track Capacitimer services
+				if (service.name && service.name.toLowerCase().startsWith('capacitimer')) {
+					// Try multiple ways to get the IP address
+					let host = null
+
+					// Try to get IP from addresses array first
+					if (service.addresses && service.addresses.length > 0) {
+						// Prefer IPv4 addresses
+						host = service.addresses.find((addr) => addr.includes('.')) || service.addresses[0]
+					}
+
+					// Fallback to other properties
+					if (!host) {
+						host = service.referer?.address || service.host || service.fqdn
+					}
+
+					// Extract hostname from FQDN (e.g., "toms-macbook-pro.local" -> "toms-macbook-pro")
+					let hostname = null
+					if (service.fqdn && service.fqdn !== host) {
+						hostname = service.fqdn.replace('.local', '')
+					} else if (service.host && service.host !== host) {
+						hostname = service.host.replace('.local', '')
+					}
+
+					this.log(
+						'debug',
+						`Bonjour service found: ${service.name}, fqdn: ${service.fqdn}, host: ${service.host}, addresses: ${JSON.stringify(service.addresses)}, resolved: ${host}`
+					)
+
+					// Check if we already have this instance
+					const existingIndex = this.discoveredInstances.findIndex((i) => i.host === host)
+
+					if (existingIndex === -1 && host) {
+						this.discoveredInstances.push({
+							name: service.name,
+							host: host,
+							hostname: hostname,
+							port: service.port,
+							fqdn: service.fqdn,
+						})
+						this.log('info', `Discovered Capacitimer instance: ${hostname || service.name} at ${host}`)
+
+						// Refresh config fields to show new instance
+						this.saveConfig(this.config)
+					}
+				}
+			})
+
+			this.bonjourBrowser.on('down', (service) => {
+				if (service.name && service.name.toLowerCase().startsWith('capacitimer')) {
+					// Try multiple ways to get the IP address (same logic as 'up')
+					let host = null
+
+					if (service.addresses && service.addresses.length > 0) {
+						host = service.addresses.find((addr) => addr.includes('.')) || service.addresses[0]
+					}
+
+					if (!host) {
+						host = service.referer?.address || service.host || service.fqdn
+					}
+
+					const index = this.discoveredInstances.findIndex((i) => i.host === host)
+
+					if (index !== -1) {
+						this.log('info', `Capacitimer instance went offline: ${service.name} at ${host}`)
+						this.discoveredInstances.splice(index, 1)
+
+						// Refresh config fields to remove offline instance
+						this.saveConfig(this.config)
+					}
+				}
+			})
+
+			this.bonjourBrowser.start()
+			this.log('debug', 'Started Bonjour service discovery for Capacitimer instances')
+		} catch (err) {
+			this.log('error', `Failed to start Bonjour discovery: ${err.message}`)
+		}
+	}
+
+	stopBonjourDiscovery() {
+		if (this.bonjourBrowser) {
+			this.bonjourBrowser.stop()
+			this.bonjourBrowser = null
+		}
+		if (this.bonjour) {
+			this.bonjour.destroy()
+			this.bonjour = null
+		}
+		this.discoveredInstances = []
+	}
+
 	initWebSocket() {
-		const host = this.config.host || 'localhost'
-		const wsPort = this.config.wsPort || 3001
+		// Use manual host if provided, otherwise use discovered host
+		const host = this.config.host || this.config.discovered
+
+		if (!host) {
+			this.updateStatus(InstanceStatus.Disconnected, 'No Capacitimer instance configured')
+			return
+		}
 
 		try {
-			this.ws = new WebSocket(`ws://${host}:${wsPort}`)
+			this.ws = new WebSocket(`ws://${host}:3001`)
 
 			this.ws.on('open', () => {
 				this.log('info', 'WebSocket connected')
@@ -155,11 +277,14 @@ class ModuleInstance extends InstanceBase {
 	}
 
 	async getTimerState() {
-		const host = this.config.host || 'localhost'
-		const httpPort = this.config.httpPort || 80
+		const host = this.config.host || this.config.discovered
+
+		if (!host) {
+			return
+		}
 
 		try {
-			const response = await fetch(`http://${host}:${httpPort}/api/timer`)
+			const response = await fetch(`http://${host}/api/timer`)
 			if (response.ok) {
 				const data = await response.json()
 				this.timerState = data
@@ -172,8 +297,12 @@ class ModuleInstance extends InstanceBase {
 	}
 
 	async sendCommand(endpoint, body = null) {
-		const host = this.config.host || 'localhost'
-		const httpPort = this.config.httpPort || 80
+		const host = this.config.host || this.config.discovered
+
+		if (!host) {
+			this.log('error', 'No Capacitimer instance configured')
+			throw new Error('No Capacitimer instance configured')
+		}
 
 		try {
 			const options = {
@@ -187,7 +316,7 @@ class ModuleInstance extends InstanceBase {
 				options.body = JSON.stringify(body)
 			}
 
-			const response = await fetch(`http://${host}:${httpPort}${endpoint}`, options)
+			const response = await fetch(`http://${host}${endpoint}`, options)
 			const data = await response.json()
 
 			if (data.success) {

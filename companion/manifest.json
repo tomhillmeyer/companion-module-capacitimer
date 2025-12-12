@@ -20,7 +20,14 @@
 		"entrypoint": "../main.js"
 	},
 	"legacyIds": [],
-	"manufacturer": "Creativeland, LLC",
-	"products": ["Capacitimer"],
-	"keywords": ["timer", "countdown", "clock", "display"]
+	"manufacturer": "Creativeland",
+	"products": [
+		"Capacitimer"
+	],
+	"keywords": [
+		"timer",
+		"countdown",
+		"clock",
+		"display"
+	]
 }
