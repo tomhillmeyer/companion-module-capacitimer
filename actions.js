@@ -152,12 +152,6 @@ module.exports = function (self) {
 					label: 'Count Up After Zero',
 					default: false,
 				},
-				{
-					id: 'showTimeOfDay',
-					type: 'checkbox',
-					label: 'Show Time of Day',
-					default: true,
-				},
 			],
 			callback: async (event) => {
 				try {
@@ -167,7 +161,6 @@ module.exports = function (self) {
 						showSeconds: event.options.showSeconds,
 						showMilliseconds: event.options.showMilliseconds,
 						countUpAfterZero: event.options.countUpAfterZero,
-						showTimeOfDay: event.options.showTimeOfDay,
 					})
 				} catch (err) {
 					self.log('error', `Update settings failed: ${err.message}`)
